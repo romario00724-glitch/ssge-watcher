@@ -152,8 +152,25 @@ INT_PARAMS = ("municipalityId", "subwayStationDistance", "areaFrom", "areaTo", "
 JSON_PARAMS = ("advancedSearch", "statuses")
 
 
+RETRY_STATUSES = (403, 429, 500, 502, 503, 504)  # відмови, які в ss.ge бувають разовими
+
+
 def _http(url, headers=None, payload=None):
-    """GET, а з payload — POST із JSON. Повертає (код, текст)."""
+    """GET, а з payload — POST із JSON. Повертає (код, текст).
+
+    Якщо сайт відмовив (403, 429, 5xx), чекає кілька секунд і пробує ще раз: 30.09.2026 о 17:05
+    ss.ge разово відповів 403, а вже о 17:15 усе працювало.
+    """
+    status, body = _http_once(url, headers, payload)
+    if status in RETRY_STATUSES:
+        pause = random.uniform(5, 10)
+        log(f"  {urllib.parse.urlsplit(url).netloc}: HTTP {status}, пробую ще раз за {pause:.0f} с")
+        time.sleep(pause)
+        status, body = _http_once(url, headers, payload)
+    return status, body
+
+
+def _http_once(url, headers=None, payload=None):
     try:
         if cffi_requests:
             if payload is None:
@@ -173,16 +190,17 @@ def _http(url, headers=None, payload=None):
         raise FetchError(f"мережева помилка: {e}") from e
 
 
-def check_status(status):
+def check_status(status, where):
+    """where — хто відповів, щоб у лозі було видно, на якому кроці відмова."""
     if status != 200:
         hint = " — схоже на захист від ботів" if status in (403, 429, 503) else ""
-        raise FetchError(f"HTTP {status}{hint}")
+        raise FetchError(f"{where}: HTTP {status}{hint}")
 
 
 def page_data(url):
     """Дані сторінки сайту: Next.js кладе їх у <script id="__NEXT_DATA__">."""
     status, body = _http(url, {"Accept-Language": LANG})
-    check_status(status)
+    check_status(status, "сторінка ss.ge")
     match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', body, re.S)
     if not match:
         raise FetchError("на сторінці немає даних — можливо, це сторінка перевірки від Cloudflare")
@@ -199,7 +217,11 @@ def api_token(refresh=False):
     """Гостьовий ключ до API ss.ge. Сайт кладе його в кожну сторінку, діє він годину."""
     global _api_token
     if refresh or not _api_token:
-        _api_token = clean(page_data(f"{SITE}/{LANG}/").get("credentialsToken"))
+        try:
+            data = page_data(f"{SITE}/{LANG}/")
+        except FetchError as e:
+            raise FetchError(f"ключ до API з головної: {e}") from e
+        _api_token = clean(data.get("credentialsToken"))
         if not _api_token:
             raise FetchError("на сторінці ss.ge немає ключа до API — можливо, сайт змінився")
     return _api_token
@@ -224,7 +246,7 @@ def api_call(path, payload=None, params=None):
         if status != 401 or attempt:
             break
         api_token(refresh=True)  # ключ прострочився — беремо свіжий
-    check_status(status)
+    check_status(status, "API ss.ge")
     try:
         return json.loads(body)
     except ValueError:
