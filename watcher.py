@@ -339,6 +339,24 @@ def district_name(address):
     return re.sub(r"^Район\s+(?=[А-ЯЁA-Z])", "", name)
 
 
+HOUSE_NUMBER_MAX = 15  # довше — це вже не номер будинку
+
+
+def ss_address(addr):
+    """Вулиця з номером будинку → (адреса, текст з поля номера, якщо там не номер).
+
+    Буває, що автор пише в поле «номер будинку» весь опис (30.09.2026, оголошення 36886722),
+    тоді в адресі лишаємо саму вулицю, а текст іде в опис.
+    """
+    street, number = clean(addr.get("streetTitle")), clean(addr.get("streetNumber"))
+    stray = number if len(number) > HOUSE_NUMBER_MAX else ""
+    if stray:
+        number = ""
+    if not street:  # сам номер будинку без вулиці нічого не каже
+        return "", stray
+    return " ".join(x for x in (street, number) if x), stray
+
+
 def ss_time(value):
     """ss.ge пише 7 знаків після секунд, а Python до 3.11 розуміє лише 6."""
     return re.sub(r"(\.\d{6})\d+", r"\1", clean(value))
@@ -362,6 +380,7 @@ def normalize(it):
     """Оголошення ss.ge → ті самі поля, що в myhome.ge. Тож повідомлення й база працюють без змін."""
     addr, price = as_dict(it.get("address")), as_dict(it.get("price"))
     rooms = ROOMS_IN_TITLE.search(clean(it.get("title")))
+    address, stray = ss_address(addr)
     return {
         "id": int(it["applicationId"]),
         "dynamic_title": clean(it.get("title")),
@@ -374,9 +393,8 @@ def normalize(it):
         "total_floors": whole(it.get("totalAmountOfFloor")),
         "city_name": clean(addr.get("cityTitle")),
         "urban_name": district_name(addr),
-        "address": " ".join(x for x in (clean(addr.get("streetTitle")), clean(addr.get("streetNumber"))) if x)
-                   if clean(addr.get("streetTitle")) else "",  # сам номер будинку без вулиці нічого не каже
-        "comment": description_text(it.get("description")),
+        "address": address,
+        "comment": description_text(it.get("description")).strip() or stray,
         "images": ss_images(it.get("appImages")),
         "created_at": ss_time(it.get("createDate")),
         "last_updated": ss_time(it.get("orderDate")),
