@@ -1,0 +1,53 @@
+name: ssge-watcher
+
+on:
+  schedule:
+    - cron: "8,18,28,38,48,58 * * * *"   # запасний; справжній будильник — cron-job.org о :05, :15, :25…
+  workflow_dispatch:          # кнопка «Run workflow» для ручного запуску
+
+permissions:
+  contents: write             # щоб зберігати state.json у репозиторій
+
+concurrency:
+  group: ssge-watcher
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref_name }}   # свіжий state.json, а не той, що був, коли запуск став у чергу
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Check ss.ge
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
+        run: python watcher.py --once
+
+      - name: Save state.json
+        if: always()
+        run: |
+          [ -f state.json ] || exit 0
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git diff --cached --quiet && exit 0
+          git commit -q -m "state: update [skip ci]"
+          for i in 1 2 3; do
+            git push -q && exit 0
+            git pull -q --rebase -X theirs || true
+            sleep 3
+          done
+          echo "Could not push state.json"

@@ -1,0 +1,9 @@
+# Токен бота — ніколи не викладати на GitHub
+telegram.json
+
+# Сміття
+.DS_Store
+__pycache__/
+*.pyc
+dump_list.json
+dump_detail.json
