@@ -45,6 +45,8 @@ PAGE_SIZE = 16                 # оголошень на сторінці — с
 FETCH_DETAILS = True           # догружати картку нового оголошення (телефон, автор)
 AGENT_THRESHOLD = 3            # від скількох оголошень в одного автора ставити позначку ⚠️
 SKIP_SUSPECTED_AGENTS = False  # True — такі оголошення взагалі не надсилати
+SKIP_SITE_AGENTS = True        # не надсилати, якщо ss.ge сам ставить автору значок «Агент»
+                               # (фільтр «От собственника» пропускає агентів-приватних осіб)
 MAX_ALERTS_PER_RUN = 25        # запобіжник від спаму; решта прийде наступного запуску
 LOOP_MINUTES = 10              # інтервал у безперервному режимі
 FAIL_ALERT_AFTER = 6           # після скількох невдалих перевірок поспіль написати в Telegram
@@ -58,7 +60,7 @@ SEARCHES_FILE = BASE_DIR / "searches.txt"
 STATE_FILE = BASE_DIR / "state.json"
 TELEGRAM_FILE = BASE_DIR / "telegram.json"  # {"token": "...", "chat_id": "...", "openai_key": "..."} — не викладати на GitHub!
 
-API_URL = "https://api-gateway.ss.ge/v1/RealEstate/LegendSearch"
+API_BASE = "https://api-gateway.ss.ge"
 SITE = "https://home.ss.ge"
 LISTING_ROOTS = {"ru": "недвижимость", "en": "real-estate", "ka": "udzravi-qoneba"}
 GEORGIA_TZ = timezone(timedelta(hours=4))  # у Грузії немає переходу на літній час
@@ -214,9 +216,11 @@ def api_headers():
     }
 
 
-def api_search(payload):
+def api_call(path, payload=None, params=None):
+    """Запит до API ss.ge: GET, а з payload — POST. На 401 бере свіжий ключ і пробує ще раз."""
+    url = API_BASE + path + ("?" + urllib.parse.urlencode(params) if params else "")
     for attempt in range(2):
-        status, body = _http(API_URL, api_headers(), payload)
+        status, body = _http(url, api_headers(), payload)
         if status != 401 or attempt:
             break
         api_token(refresh=True)  # ключ прострочився — беремо свіжий
@@ -287,7 +291,7 @@ def search_key(params):
 
 
 def fetch_page(params, page):
-    data = api_search({**params, "page": page, "pageSize": PAGE_SIZE})
+    data = api_call("/v1/RealEstate/LegendSearch", {**params, "page": page, "pageSize": PAGE_SIZE})
     items = as_dict(data).get("realStateItemModel")
     if not isinstance(items, list):
         raise FetchError("неочікуваний формат відповіді — можливо, сайт змінив API")
@@ -305,12 +309,12 @@ def description_text(value):
 
 
 def district_name(address):
-    """«Район Старый Батуми» → «Старый Батуми». Загальне «Районы Батуми» пропускаємо."""
+    """«Район Старый Батуми» → «Старый Батуми», але «Район аэропорта» лишається. «Районы Батуми» пропускаємо."""
     name = clean(address.get("subdistrictTitle"))
     district = clean(address.get("districtTitle"))
     if not name and not district.lower().startswith("район"):
         name = district
-    return re.sub(r"(?i)^район\s+", "", name)
+    return re.sub(r"^Район\s+(?=[А-ЯЁA-Z])", "", name)
 
 
 def ss_time(value):
@@ -413,42 +417,48 @@ def apply_author_listing_count(item, data):
         item["_site_count"], item["_site_count_field"] = number, field
 
 
-def fetch_detail(item):
-    """Дані зі сторінки оголошення (applicationData)."""
-    detail = as_dict(page_data(listing_url(item)).get("applicationData"))
-    if not detail:
-        raise FetchError("на сторінці оголошення немає даних — можливо, його вже зняли")
-    return detail
+def author_info(user_id):
+    """Автор з API: ім'я, телефони, скільки в нього оголошень на сайті (так само рахує сам ss.ge)."""
+    data = api_call("/v1/RealEstate/user-all-applications", {"userId": user_id, "page": 1, "pageSize": 1})
+    return as_dict(as_dict(data).get("userInformatino"))  # sic: так поле називається в ss.ge
 
 
 def enrich_with_details(item):
-    """Догружає сторінку оголошення: телефон, ім'я, кімнати, повний опис, усі фото й кількість оголошень автора."""
+    """Догружає те, чого немає у видачі: ім'я, телефон, кількість оголошень автора на сайті
+    і чи ставить йому ss.ge значок «Агент».
+
+    Сторінку оголошення не відкриваємо: з серверів GitHub ss.ge її не віддає (30 с тиші),
+    а API відповідає — тож усе береться з трьох маленьких запитів до API.
+    """
     apply_author_listing_count(item, item)  # раптом лічильник є вже у видачі
+    uid, user_phones = clean(item.get("user_id")), []
+    if uid:
+        try:
+            user = author_info(uid)
+            count = to_int(user.get("applicationCount"))
+            if count and "_site_count" not in item:
+                item["_site_count"], item["_site_count_field"] = count, "applicationCount"
+            if clean(user.get("contactPerson")):
+                item["user_title"] = clean(user["contactPerson"])
+            user_phones = [clean(ph) for ph in user.get("phones") or [] if clean(ph)]
+        except FetchError as e:
+            log(f"  автор {item['id']}: {e}")
+        try:
+            info = as_dict(api_call("/v1/Agent/agent-info", params={"userId": uid}))
+            item["_site_agent"] = to_int(info.get("infoType")) not in (None, 0)  # 0 — звичайна особа
+        except FetchError as e:
+            log(f"  значок агента {item['id']}: {e}")
     try:
-        detail = fetch_detail(item)
+        phones = api_call("/v1/RealEstate/application-phones", params={"applicationId": item["id"]})
     except FetchError as e:
-        log(f"  картка {item['id']}: {e}")
-        return item
-    if "_site_count" not in item:
-        apply_author_listing_count(item, detail)
-    phones = [ph for ph in detail.get("applicationPhones") or []
-              if isinstance(ph, dict) and clean(ph.get("phoneNumber"))]
-    phones.sort(key=lambda ph: not ph.get("isMain"))
-    if phones:
-        item["user_phone_number"] = clean(phones[0]["phoneNumber"])
-        item["additional_phone_number"] = ", ".join(clean(ph["phoneNumber"]) for ph in phones[1:])
-    for key, value in (("user_title", detail.get("contactPerson")), ("room", detail.get("rooms")),
-                       ("bedroom", detail.get("bedrooms")), ("floor", detail.get("floor")),
-                       ("total_floors", detail.get("floors")), ("area", detail.get("totalArea")),
-                       ("user_id", detail.get("userId"))):
-        if clean(whole(value)) not in ("", "0"):
-            item[key] = whole(value)
-    comment = description_text(detail.get("description"))
-    if len(clean(comment)) > len(clean(item.get("comment"))):
-        item["comment"] = comment
-    images = ss_images(detail.get("appImages"))
-    if len(images) > len(item.get("images") or []):
-        item["images"] = images
+        log(f"  телефон {item['id']}: {e}")
+        phones = []
+    phones = sorted((ph for ph in phones if isinstance(ph, dict) and clean(ph.get("phoneNumber"))),
+                    key=lambda ph: not ph.get("isMain")) if isinstance(phones, list) else []
+    numbers = [clean(ph["phoneNumber"]) for ph in phones] or user_phones
+    if numbers:
+        item["user_phone_number"] = numbers[0]
+        item["additional_phone_number"] = ", ".join(numbers[1:])
     return item
 
 
@@ -1029,6 +1039,9 @@ def run_once(state):
         if SKIP_SUSPECTED_AGENTS and suspect >= AGENT_THRESHOLD:
             log(f"  пропускаю {item['id']}: у автора {suspect} оголошень")
             delivered = True
+        elif SKIP_SITE_AGENTS and item.get("_site_agent"):
+            log(f"  пропускаю {item['id']}: ss.ge ставить автору значок «Агент»")
+            delivered = True
         elif telegram_ready():
             delivered = send_listing(item, label, count)
         else:
@@ -1089,16 +1102,23 @@ def cmd_test():
 def cmd_dump():
     """Зберігає «сирі» відповіді сайту, щоб подивитися, які поля там є."""
     label, url = load_searches()[0]
-    raw_list = api_search({**search_params(url), "page": 1, "pageSize": PAGE_SIZE})
+    raw_list = api_call("/v1/RealEstate/LegendSearch", {**search_params(url), "page": 1, "pageSize": PAGE_SIZE})
     (BASE_DIR / "dump_list.json").write_text(
         json.dumps(raw_list, ensure_ascii=False, indent=2), encoding="utf-8")
     items = as_dict(raw_list).get("realStateItemModel") or []
     log(f"[{label}] збережено dump_list.json ({len(items)} оголошень)")
     if items and isinstance(items[0], dict) and to_int(items[0].get("applicationId")):
-        raw_detail = fetch_detail(normalize(items[0]))
+        first = items[0]
+        raw_detail = {
+            "user-all-applications": api_call("/v1/RealEstate/user-all-applications",
+                                              {"userId": first.get("userId"), "page": 1, "pageSize": 1}),
+            "agent-info": api_call("/v1/Agent/agent-info", params={"userId": first.get("userId")}),
+            "application-phones": api_call("/v1/RealEstate/application-phones",
+                                           params={"applicationId": first["applicationId"]}),
+        }
         (BASE_DIR / "dump_detail.json").write_text(
             json.dumps(raw_detail, ensure_ascii=False, indent=2), encoding="utf-8")
-        log("збережено dump_detail.json (картка першого оголошення)")
+        log("збережено dump_detail.json (автор, значок агента й телефон першого оголошення)")
     return 0
 
 
