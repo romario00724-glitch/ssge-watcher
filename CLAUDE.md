@@ -5,7 +5,7 @@
 myhome, але **окремим ботом** з власним токеном. Уся логіка — в одному файлі `watcher.py`.
 Мова коду, коментарів і повідомлень — українська.
 
-## Близнюк: ~/Desktop/myhome-watcher
+## Близнюк: ~/Desktop/Скрапери/myhome-watcher
 
 Цей проєкт — копія `myhome-watcher` (github.com/romario00724-glitch/myhome-watcher), у якій
 замінено лише шар роботи з сайтом (розділ `# ── ss.ge ──` у `watcher.py`). `normalize()`
