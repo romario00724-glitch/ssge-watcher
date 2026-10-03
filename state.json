@@ -1081,7 +1081,7 @@
 "2026-10-02"
 ]
 },
-"fail_streak": 0,
+"fail_streak": 1,
 "searches": {
 "{\"advancedSearch\":{\"individualEntityOnly\":true},\"cityIdList\":[96],\"order\":1,\"realEstateDealType\":1,\"realEstateType\":5}": "2026-09-30"
 },
